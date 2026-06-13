@@ -48,6 +48,12 @@ TRUSTED         = [ipaddress.ip_network(n.strip()) for n in os.environ.get("TRUS
 CLIENT_ID       = os.environ.get("CLIENT_ID", "plex-forward-auth")
 PRODUCT         = os.environ.get("PRODUCT", "Plex Forward Auth")
 PLEX_HDR        = {"X-Plex-Client-Identifier": CLIENT_ID, "X-Plex-Product": PRODUCT, "Accept": "application/json"}
+# Per-host policy: ALLOWED_PLEX_IDS/EMAILS = owner/admin (allowed everywhere). Hosts
+# listed in MEMBER_HOSTS additionally allow ANY Plex server member (checked against
+# Tautulli at sign-in and cached in the cookie). Everything else stays owner-only.
+TAUTULLI_URL    = os.environ.get("TAUTULLI_URL", "").rstrip("/")
+TAUTULLI_KEY    = os.environ.get("TAUTULLI_KEY", "")
+MEMBER_HOSTS    = {h.strip().lower() for h in os.environ.get("MEMBER_HOSTS", "").split(",") if h.strip()}
 
 if not APP_SECRET:
     APP_SECRET = secrets.token_urlsafe(32)
@@ -89,6 +95,22 @@ def allowed(user: dict) -> bool:
     if ALLOWED_IDS or ALLOWED_EMAILS:
         return uid in ALLOWED_IDS or (bool(email) and email in ALLOWED_EMAILS)
     return True  # no allow-list => any authenticated Plex user (set an allow-list!)
+
+
+def is_member(user: dict) -> bool:
+    """Owner/admin OR a user of THIS Plex server (matched against Tautulli)."""
+    if allowed(user):
+        return True
+    if not (TAUTULLI_URL and TAUTULLI_KEY):
+        return False
+    try:
+        u = f"{TAUTULLI_URL}/api/v2?apikey={TAUTULLI_KEY}&cmd=get_users"
+        users = json.load(urllib.request.urlopen(u, timeout=8))["response"]["data"]
+    except Exception:
+        return False
+    uid, email = str(user.get("id")), (user.get("email") or "").lower()
+    return any(str(m.get("user_id")) == uid or (email and (m.get("email") or "").lower() == email)
+               for m in users)
 
 
 # ---------- Plex PIN OAuth ----------
@@ -212,9 +234,17 @@ class H(BaseHTTPRequestHandler):
             if trusted(self._client_ip()):
                 return self._send(200, "", "text/plain")
             s = self._session()
-            if s and allowed({"id": s.get("sub"), "email": s.get("email")}):
-                return self._send(200, "", "text/plain",
-                                  headers=[("X-Auth-User", str(s.get("name") or s.get("sub") or ""))])
+            if s:
+                sub = str(s.get("sub") or "")
+                adm = bool(s.get("adm")) or sub in ALLOWED_IDS or (
+                    bool(ALLOWED_EMAILS) and (s.get("email") or "").lower() in ALLOWED_EMAILS)
+                mbr = bool(s.get("mbr")) or adm
+                host = (self.headers.get("X-Original-Host") or self.headers.get("Host") or "").lower()
+                ok = mbr if host in MEMBER_HOSTS else adm
+                if ok:
+                    return self._send(200, "", "text/plain",
+                                      headers=[("X-Auth-User", str(s.get("name") or sub or "")),
+                                               ("X-Auth-Admin", "1" if adm else "0")])
             return self._send(401, "", "text/plain")
 
         if u.path == "/login":
@@ -236,12 +266,13 @@ class H(BaseHTTPRequestHandler):
                 if not token:
                     return self._send(408, "Plex authorization timed out — try again.", "text/plain")
                 user = plex_user(token)
-                if not allowed(user):
+                adm = allowed(user)
+                mbr = adm or is_member(user)
+                if not mbr:
                     name = html.escape(user.get("username") or user.get("title") or "that account")
-                    return self._send(403, f"Sorry, {name} is not permitted to access this server.",
-                                      "text/plain")
+                    return self._send(403, f"Sorry, {name} is not a member of this server.", "text/plain")
                 payload = {"sub": str(user.get("id")), "name": user.get("username") or user.get("title"),
-                           "email": (user.get("email") or "").lower(),
+                           "email": (user.get("email") or "").lower(), "adm": adm, "mbr": mbr,
                            "exp": int(time.time() + SESSION_DAYS * 86400)}
                 cookie = (f"{COOKIE_NAME}={sign(payload)}; Path=/; HttpOnly; Secure; SameSite=Lax; "
                           f"Max-Age={SESSION_DAYS*86400}" + (f"; Domain={COOKIE_DOMAIN}" if COOKIE_DOMAIN else ""))
