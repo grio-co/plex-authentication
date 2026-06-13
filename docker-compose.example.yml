@@ -1,0 +1,19 @@
+# Run the gateway next to your reverse proxy (same docker network).
+services:
+  plex-forward-auth:
+    build: ./forward-auth          # or image: ghcr.io/grioghar/plex-forward-auth:latest
+    container_name: plex-forward-auth
+    environment:
+      # --- required ---
+      - APP_SECRET=${APP_SECRET}                 # long random string; signs the SSO cookie
+      - ALLOWED_PLEX_IDS=1382106                 # "only me": your Plex account id(s)
+      # - ALLOWED_PLEX_EMAILS=you@example.com    # or allow by email
+      # --- SSO scope ---
+      - COOKIE_DOMAIN=.example.com               # one cookie for *.example.com
+      - PUBLIC_URL=https://auth.example.com      # this service's public URL
+      - REDIRECT_SUFFIX=.example.com             # open-redirect guard
+      # --- lock-out safety: these networks skip auth entirely ---
+      - TRUSTED=192.168.1.0/24,100.64.0.0/10,172.16.0.0/12
+      - SESSION_DAYS=30
+    restart: unless-stopped
+    # expose 8056 only to the proxy network; no host port needed
