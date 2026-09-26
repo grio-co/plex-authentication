@@ -84,4 +84,17 @@ proxy" setting that removes the second login.
   every request.
 - TLS is terminated by your proxy; the cookie is `Secure; HttpOnly; SameSite=Lax`.
 
+## Development
+
+The gateway is a single stdlib-only file, and so is its test-suite (no
+`pip install` needed). The tests spin the real server up on a loopback port and
+stub every call to plex.tv / Tautulli — nothing touches the network:
+
+```sh
+python -m unittest discover -s tests
+```
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same
+command on every push and pull request.
+
 MIT licensed. Not affiliated with Plex Inc.
