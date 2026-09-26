@@ -97,6 +97,10 @@ class ServerTestCase(unittest.TestCase):
             side_effect=AssertionError("network access attempted in tests"))
         self._no_net.start()
         self.addCleanup(self._no_net.stop)
+        # A fresh sign-in rate limiter per test so tests never bleed into each other.
+        limiter = mock.patch.object(mod, "LIMITER", mod.RateLimiter(mod.LOGIN_RATE_LIMIT, mod.LOGIN_RATE_WINDOW))
+        limiter.start()
+        self.addCleanup(limiter.stop)
 
     def request(self, path, headers=None, method="GET"):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
