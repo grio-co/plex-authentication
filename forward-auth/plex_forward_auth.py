@@ -29,15 +29,48 @@ Who gets in
 Env (all optional except APP_SECRET in production):
   APP_SECRET COOKIE_DOMAIN COOKIE_NAME ALLOWED_PLEX_IDS ALLOWED_PLEX_EMAILS
   TRUSTED PUBLIC_URL SESSION_DAYS PORT CLIENT_ID PRODUCT REDIRECT_SUFFIX
+  COOKIE_SECURE COOKIE_SAMESITE TRUST_PROXY_HEADERS
+  LOGIN_RATE_LIMIT LOGIN_RATE_WINDOW
 """
-import os, json, time, hmac, hashlib, base64, secrets, ipaddress
+import os, json, time, hmac, hashlib, base64, secrets, ipaddress, math, threading
 import urllib.request, urllib.parse, html
+from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on")
+
+
+def _env_samesite(name: str, default: str = "Lax") -> str:
+    v = os.environ.get(name, "").strip().lower()
+    if not v:
+        return default
+    if v in ("lax", "strict", "none"):
+        return v.capitalize()
+    print(f"WARNING: {name}={os.environ.get(name)!r} is not Lax/Strict/None — using {default}.", flush=True)
+    return default
+
 
 APP_SECRET      = os.environ.get("APP_SECRET", "")
 COOKIE_DOMAIN   = os.environ.get("COOKIE_DOMAIN", "")
 COOKIE_NAME     = os.environ.get("COOKIE_NAME", "plexauth")
+# Cookie attributes. HttpOnly is always set. Secure is on by default — only turn it
+# off if you really serve the gateway over plain http (e.g. local testing).
+COOKIE_SECURE   = _env_bool("COOKIE_SECURE", True)
+COOKIE_SAMESITE = _env_samesite("COOKIE_SAMESITE", "Lax")
+# The reverse proxy sets X-Real-IP / X-Forwarded-For to the true client. Set to 0
+# if the gateway is exposed directly (then the socket peer address is used).
+TRUST_PROXY_HEADERS = _env_bool("TRUST_PROXY_HEADERS", True)
+# Sign-in rate limit per client IP (sliding window over /login + /callback).
+# LOGIN_RATE_LIMIT=0 disables it.
+LOGIN_RATE_LIMIT  = int(os.environ.get("LOGIN_RATE_LIMIT", "10"))
+LOGIN_RATE_WINDOW = int(os.environ.get("LOGIN_RATE_WINDOW", "60"))
 PORT            = int(os.environ.get("PORT", "8056"))
 PUBLIC_URL      = os.environ.get("PUBLIC_URL", "https://auth.example.com").rstrip("/")
 SESSION_DAYS    = int(os.environ.get("SESSION_DAYS", "30"))
@@ -60,6 +93,9 @@ if not APP_SECRET:
     print("WARNING: APP_SECRET not set — generated an ephemeral one; sessions will "
           "not survive a restart. Set APP_SECRET in production.", flush=True)
 SECRET = APP_SECRET.encode()
+if COOKIE_SAMESITE == "None" and not COOKIE_SECURE:
+    print("WARNING: SameSite=None cookies are rejected by browsers unless Secure — "
+          "set COOKIE_SECURE=1.", flush=True)
 
 
 # ---------- signed stateless cookie ----------
@@ -87,6 +123,60 @@ def verify_cookie(tok: str):
         return data if data.get("exp", 0) > time.time() else None
     except Exception:
         return None
+
+
+def cookie_attrs() -> str:
+    """Attributes appended to every Set-Cookie the gateway emits (set and clear)."""
+    attrs = "; Path=/; HttpOnly"
+    if COOKIE_SECURE:
+        attrs += "; Secure"
+    attrs += f"; SameSite={COOKIE_SAMESITE}"
+    if COOKIE_DOMAIN:
+        attrs += f"; Domain={COOKIE_DOMAIN}"
+    return attrs
+
+
+class RateLimiter:
+    """Sliding-window limiter: at most `limit` hits per `window` seconds per key.
+
+    In-memory and per-process: it resets on restart and is not shared between
+    replicas. Denied attempts are not counted, so a client that keeps retrying
+    is let back in as soon as its oldest counted attempt leaves the window.
+    """
+
+    def __init__(self, limit: int, window: float, clock=time.monotonic):
+        self.limit, self.window, self.clock = int(limit), float(window), clock
+        self._hits = {}          # key -> deque[float] of accepted attempt times
+        self._lock = threading.Lock()
+        self._calls = 0
+
+    def check(self, key: str) -> int:
+        """Record an attempt for `key`. Returns 0 if allowed, else the number of
+        whole seconds until the next attempt would be allowed (>= 1)."""
+        if self.limit <= 0:
+            return 0
+        now = self.clock()
+        cutoff = now - self.window
+        with self._lock:
+            self._calls += 1
+            if self._calls % 1024 == 0:
+                self._sweep(cutoff)
+            q = self._hits.get(key)
+            if q is None:
+                q = self._hits[key] = deque()
+            while q and q[0] <= cutoff:
+                q.popleft()
+            if len(q) >= self.limit:
+                return max(1, math.ceil(q[0] + self.window - now))
+            q.append(now)
+            return 0
+
+    def _sweep(self, cutoff: float):
+        for k in [k for k, q in self._hits.items() if not q or q[-1] <= cutoff]:
+            del self._hits[k]
+
+
+LIMITER = RateLimiter(LOGIN_RATE_LIMIT, LOGIN_RATE_WINDOW)
 
 
 def allowed(user: dict) -> bool:
@@ -199,9 +289,12 @@ class H(BaseHTTPRequestHandler):
 
     def _client_ip(self):
         # The reverse proxy sets X-Real-IP / X-Forwarded-For to the true client.
-        return ((self.headers.get("X-Real-IP")
-                 or (self.headers.get("X-Forwarded-For") or "").split(",")[0]).strip()
-                or self.client_address[0])
+        if TRUST_PROXY_HEADERS:
+            fwd = (self.headers.get("X-Real-IP")
+                   or (self.headers.get("X-Forwarded-For") or "").split(",")[0]).strip()
+            if fwd:
+                return fwd
+        return self.client_address[0]
 
     def _session(self):
         return verify_cookie(self._cookies().get(COOKIE_NAME, ""))
@@ -247,6 +340,13 @@ class H(BaseHTTPRequestHandler):
                                                ("X-Auth-Admin", "1" if adm else "0")])
             return self._send(401, "", "text/plain")
 
+        # ---- sign-in flow: rate limited per client IP (both legs hit plex.tv) ----
+        if u.path in ("/login", "/callback"):
+            wait = LIMITER.check(self._client_ip())
+            if wait:
+                return self._send(429, "Too many sign-in attempts — try again later.", "text/plain",
+                                  headers=[("Retry-After", str(wait))])
+
         if u.path == "/login":
             try:
                 pid, code = plex_pin()
@@ -274,15 +374,13 @@ class H(BaseHTTPRequestHandler):
                 payload = {"sub": str(user.get("id")), "name": user.get("username") or user.get("title"),
                            "email": (user.get("email") or "").lower(), "adm": adm, "mbr": mbr,
                            "exp": int(time.time() + SESSION_DAYS * 86400)}
-                cookie = (f"{COOKIE_NAME}={sign(payload)}; Path=/; HttpOnly; Secure; SameSite=Lax; "
-                          f"Max-Age={SESSION_DAYS*86400}" + (f"; Domain={COOKIE_DOMAIN}" if COOKIE_DOMAIN else ""))
+                cookie = f"{COOKIE_NAME}={sign(payload)}; Max-Age={SESSION_DAYS*86400}" + cookie_attrs()
                 return self._send(302, "", headers=[("Location", safe_rd(rd)), ("Set-Cookie", cookie)])
             except Exception as e:
                 return self._send(502, f"plex callback error: {e}", "text/plain")
 
         if u.path == "/logout":
-            clear = (f"{COOKIE_NAME}=; Path=/; Max-Age=0"
-                     + (f"; Domain={COOKIE_DOMAIN}" if COOKIE_DOMAIN else ""))
+            clear = f"{COOKIE_NAME}=; Max-Age=0" + cookie_attrs()
             return self._send(302, "", headers=[("Location", safe_rd(rd)), ("Set-Cookie", clear)])
 
         # status / sign-in landing
@@ -308,4 +406,8 @@ if __name__ == "__main__":
             if (ALLOWED_IDS or ALLOWED_EMAILS) else "OPEN (any Plex user — set an allow-list!)")
     print(f"plex-forward-auth on :{PORT}  domain={COOKIE_DOMAIN or '(host-only)'}  "
           f"trusted={[str(n) for n in TRUSTED]}  {mode}", flush=True)
+    print(f"cookie: Secure={'on' if COOKIE_SECURE else 'OFF'} SameSite={COOKIE_SAMESITE}  "
+          f"proxy-headers={'trusted' if TRUST_PROXY_HEADERS else 'ignored'}  "
+          f"login-rate-limit={LOGIN_RATE_LIMIT}/{LOGIN_RATE_WINDOW}s"
+          + ("" if LOGIN_RATE_LIMIT > 0 else " (disabled)"), flush=True)
     Server(("0.0.0.0", PORT), H).serve_forever()

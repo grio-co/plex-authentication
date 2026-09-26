@@ -71,6 +71,11 @@ proxy" setting that removes the second login.
 | `REDIRECT_SUFFIX` | — | only redirect back to hosts ending with this (open-redirect guard) |
 | `TRUSTED` | — | CIDRs that bypass auth (LAN / Tailscale / docker) |
 | `SESSION_DAYS` | `30` | cookie lifetime |
+| `COOKIE_SECURE` | `1` | add the `Secure` flag to the cookie (only turn off for plain-http local testing) |
+| `COOKIE_SAMESITE` | `Lax` | cookie `SameSite` value: `Lax`, `Strict` or `None` (`None` requires `COOKIE_SECURE=1`) |
+| `TRUST_PROXY_HEADERS` | `1` | read the client IP from `X-Real-IP` / `X-Forwarded-For` (set by your proxy). Set `0` if the gateway is reachable directly, so clients cannot spoof their IP |
+| `LOGIN_RATE_LIMIT` | `10` | sign-in attempts (`/login` + `/callback`) allowed per client IP per window; `0` disables |
+| `LOGIN_RATE_WINDOW` | `60` | length of that sliding window, in seconds |
 | `PORT` | `8056` | listen port |
 
 > ⚠️ With **no** allow-list set, any Plex account is accepted. Set
@@ -82,6 +87,29 @@ proxy" setting that removes the second login.
   id/username/email + expiry. Treat `APP_SECRET` like a password.
 - `/verify` does no network I/O — it's a cheap IP/cookie check, fine to run on
   every request.
-- TLS is terminated by your proxy; the cookie is `Secure; HttpOnly; SameSite=Lax`.
+- TLS is terminated by your proxy; the cookie is `HttpOnly; Secure; SameSite=Lax`
+  by default (`COOKIE_SECURE` / `COOKIE_SAMESITE` tune the last two; `HttpOnly`
+  is always on). `/logout` clears it with the same attributes.
+- `/login` and `/callback` are rate limited per client IP (`LOGIN_RATE_LIMIT`
+  per `LOGIN_RATE_WINDOW` seconds, default 10/60s). Over the limit the gateway
+  answers `429` with a `Retry-After` header and does not call plex.tv. The
+  limiter is in-memory: it resets on restart and is per replica.
+- The client IP comes from `X-Real-IP` / `X-Forwarded-For` because the gateway
+  is meant to sit behind your proxy (the bundled snippets set them). Those
+  headers drive both the `TRUSTED` bypass and the rate limiter, so never expose
+  port 8056 directly — or set `TRUST_PROXY_HEADERS=0` if you must.
+
+## Development
+
+The gateway is a single stdlib-only file, and so is its test-suite (no
+`pip install` needed). The tests spin the real server up on a loopback port and
+stub every call to plex.tv / Tautulli — nothing touches the network:
+
+```sh
+python -m unittest discover -s tests
+```
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same
+command on every push and pull request.
 
 MIT licensed. Not affiliated with Plex Inc.
